@@ -6,7 +6,7 @@ This repository contains the full analysis pipeline and interactive visualisatio
 
 The project aims to explore how the **Lem2 p.L13R mutation** perturbs gene expression programs and nuclear architecture in a murine model of neonatal dilated cardiomyopathy (DCM). 
 It comprises:
-1. Longitudinal direct RNA-seq analysis of mouse hearts (E18.5, P1, P3)
+1. Longitudinal direct RNA-seq analysis of mouse cardiomyocytes (E18.5, P1, P3)
 2. Machine learning-based nuclear segmentation of light-sheet microscopy images
 3. Interactive data exploration via R Shiny dashboard
 

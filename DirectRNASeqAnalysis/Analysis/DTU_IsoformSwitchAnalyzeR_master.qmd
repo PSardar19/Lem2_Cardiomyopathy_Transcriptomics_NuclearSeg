@@ -1,0 +1,275 @@
+---
+title: "DTU_IsoformSwitchAnalyzeR"
+author: "Payel Sardar"
+format: html
+---
+
+### Importing packages
+```{r}
+library(IsoformSwitchAnalyzeR)
+library(tidyverse)
+library(edgeR)
+library(dplyr)
+```
+
+# Data Preprocessing
+```{r}
+# Load read_counts (Must contain both gene and transcript ids)
+read_counts <- read.csv('../All_stages_master/counts_transcript.txt', sep = '\t', header = TRUE)
+
+# Rename columns
+colnames(read_counts) <- c("isoform_id", "gene_id", colnames(read_counts)[3:ncol(read_counts)])
+
+# Re-order columns and round count values
+read_counts <- read_counts[, c("gene_id", "isoform_id", setdiff(colnames(read_counts), c("gene_id", "isoform_id")))]
+read_counts[, -(1:2)] <- round(read_counts[, -(1:2)])
+
+# Build proper matrix
+isoformCounts <- as.matrix(read_counts[, 3:ncol(read_counts)])
+rownames(isoformCounts) <- read_counts$isoform_id
+
+# Sanity check
+head(rownames(isoformCounts))  
+```
+
+## Building the design matrix
+```{r}
+samples <- colnames(read_counts)[3:length(colnames(read_counts))]
+
+design_df <- data.frame(
+  sampleID = samples,
+  stage = sub("_.*", "", samples),
+  condition = sub("^[^_]*_([^_]*).*", "\\1", samples)
+)
+
+# Fix stage name
+design_df$stage <- gsub("E18", "E18.5", design_df$stage)
+
+# Create the group column
+#design_df$group <- paste(design_df$stage, design_df$condition, sep = "_")
+
+# Reorder if needed
+design_df <- design_df[, c("sampleID","stage", "condition")]
+
+rownames(design_df) <- design_df$sampleID
+
+design_df$stage <- factor(design_df$stage, levels = c("E18.5", "P1", "P3"))
+design_df$condition <- factor(design_df$condition, levels = c("WT", "Mut"))
+
+design_df
+```
+
+# Run IsoformSwitchAnalyzeR Preprocessing Pipeline
+
+This function preprocesses isoform-level count data and associated metadata for use with the IsoformSwitchAnalyzeR package. It optionally filters samples based on a user-defined criterion, builds a `switchAnalyzeRlist` object using the provided GTF and FASTA files, annotates open reading frames (ORFs), and prefilters genes based on expression thresholds.
+
+```{r}
+runIsoformSwitchPipeline <- function(
+  isoformCounts,
+  design_df,
+  group_var,
+  contrast_var,
+  gtfPath,
+  fastaPath,
+  filter_by = NULL
+) {
+  # Step 1: Filter samples if requested
+  if (!is.null(filter_by)) {
+    var <- filter_by$variable
+    val <- filter_by$value
+    design_df <- design_df %>% filter(.data[[var]] == val)
+    message(sprintf("Filtering samples where %s == %s", var, val))
+  }
+  
+  # Subset isoformCounts columns by filtered samples
+  isoformCounts_sub <- isoformCounts[, colnames(isoformCounts) %in% design_df$sampleID]
+  
+  # Make sure design_df and isoformCounts_sub columns match and are ordered
+  design_df <- design_df[match(colnames(isoformCounts_sub), design_df$sampleID), ]
+  
+  # Add the grouping variable column as 'condition' required by IsoformSwitchAnalyzeR
+  design_df$condition <- as.factor(design_df[[group_var]])
+  
+  design_df_filtered <- dplyr::select(
+    design_df,
+    sampleID,
+    condition
+  )
+  
+  # Step 2: Build switchAnalyzeRlist
+  switchList <- importRdata(
+    isoformCountMatrix = isoformCounts_sub,
+    designMatrix = design_df_filtered,
+    isoformExonAnnoation = gtfPath,
+    isoformNtFasta = fastaPath,
+    showProgress = FALSE
+  )
+  
+  # Step 3: Analyze ORFs
+  switchList <- analyzeORF(
+  switchAnalyzeRlist = switchList,
+  orfMethod = "longest",
+  showProgress = TRUE
+  )
+  
+  # Step 4: Prefilter genes for expression and isoform fraction
+  switchList <- preFilter(switchList, geneExpressionCutoff=1, isoformExpressionCutoff=0, removeSingleIsoformGenes=TRUE)
+  
+  # Return the prepared switchAnalyzeRlist object
+  return(switchList)
+}
+
+```
+
+
+# Perform Full Isoform Switch Analysis Pipeline
+
+This function runs a complete isoform switch analysis pipeline using the IsoformSwitchAnalyzeR package. It includes sample filtering (e.g., by developmental stage), preprocessing, isoform switch testing with DEXSeq, intron retention analysis, sequence extraction, and prediction of functional consequences.
+
+```{r}
+runIsoformSwitchAnalysis <- function(
+  isoformCounts,
+  design_df,
+  group_var,
+  contrast_var = c("Mut", "WT"),
+  gtfPath,
+  fastaPath,
+  filter_by = list(variable = "stage", value = "E18.5")
+) {
+  
+  # Step 1: Create switchAnalyzeRlist
+  message("Creating switchAnalyzeRlist for filtered stage...")
+  switchAnalyzeRlist <- runIsoformSwitchPipeline(
+    isoformCounts = isoformCounts,
+    design_df = design_df,
+    group_var = group_var,
+    contrast_var = contrast_var,
+    gtfPath = gtfPath,
+    fastaPath = fastaPath,
+    filter_by = filter_by
+  )
+  
+  # Step 2: Run DEXSeq analysis
+  message("Running isoform switch test (DEXSeq)...")
+  switchAnalyzeRlist <- isoformSwitchTestDEXSeq(
+    switchAnalyzeRlist = switchAnalyzeRlist,
+    reduceToSwitchingGenes = TRUE
+  )
+  
+  # Step 3: Analyze intron retention
+  message("Analyzing intron retention...")
+  switchAnalyzeRlist <- analyzeIntronRetention(switchAnalyzeRlist)
+  
+  # Step 4: Extract sequences
+  message("Extracting nucleotide and ORF sequences...")
+  switchAnalyzeRlist <- extractSequence(switchAnalyzeRlist)
+  
+  # Step 5: Analyze functional consequences
+  message("Analyzing switch consequences...")
+  switchAnalyzeRlist <- analyzeSwitchConsequences(
+    switchAnalyzeRlist,
+    consequencesToAnalyze = c("intron_retention", "ORF_seq_similarity", "NMD_status")
+  )
+  
+  message("Analysis complete.")
+  return(switchAnalyzeRlist)
+}
+```
+
+## Performing temporal comparison across Developmental stages for WT Condition -> will act as the baseline
+```{r}
+switchList_WT <- runIsoformSwitchAnalysis(
+  isoformCounts = isoformCounts,
+  design_df = design_df,
+  group_var = "stage",
+  contrast_var = NULL,
+  gtfPath = "../metadata/extended_annotations.gtf",
+  fastaPath = "../metadata/transcripts.fa",
+  filter_by = list(variable = "condition", value = "WT")
+)
+```
+
+## Performing temporal comparison across Developmental stages for Mutant Condition
+```{r}
+switchList_Mut <- runIsoformSwitchAnalysis(
+  isoformCounts = isoformCounts,
+  design_df = design_df,
+  group_var = "stage",
+  contrast_var = NULL,
+  gtfPath = "../metadata/extended_annotations.gtf",
+  fastaPath = "../metadata/transcripts.fa",
+  filter_by = list(variable = "condition", value = "Mut")  # keep only Mutant samples
+)
+```
+
+```{r}
+saveRDS(switchList_WT, file = "../DTU/switchList_WT.rds")
+saveRDS(switchList_Mut, file = "../DTU/switchList_Mut.rds")
+```
+
+## Stagewise comparison between Mut and WT
+
+### For stage E18.5
+```{r}
+switchList_E18.5 <- runIsoformSwitchAnalysis(
+  isoformCounts = isoformCounts,
+  design_df = design_df,
+  group_var = "condition",
+  contrast_var = c('WT', 'Mut'),
+  gtfPath = "../metadata/extended_annotations.gtf",
+  fastaPath = "../metadata/transcripts.fa",
+  filter_by = list(variable = "stage", value = "E18.5")  # keep only E18.5 samples
+)
+```
+
+Extract summary
+```{r}
+extractSwitchSummary(
+  switchAnalyzeRlist = switchList_E18.5,
+  filterForConsequences = TRUE,
+  dIFcutoff = 0.1
+)
+```
+
+```{r}
+extractTopSwitches(switchList_E18.5, filterForConsequences = TRUE, n=5)
+```
+
+```{r}
+saveRDS(switchList_E18.5, file = "../DTU/switchList_E18.5.rds")
+```
+
+### For stage P1
+```{r}
+switchList_P1 <- runIsoformSwitchAnalysis(
+  isoformCounts = isoformCounts,
+  design_df = design_df,
+  group_var = "condition",
+  contrast_var = c('WT', 'Mut'),
+  gtfPath = "../metadata/extended_annotations.gtf",
+  fastaPath = "../metadata/transcripts.fa",
+  filter_by = list(variable = "stage", value = "P1")  # keep only P1 samples
+)
+```
+
+```{r}
+saveRDS(switchList_P1, file = "../DTU/switchList_P1.rds")
+```
+
+### For Stage P3
+```{r}
+switchList_P3 <- runIsoformSwitchAnalysis(
+  isoformCounts = isoformCounts,
+  design_df = design_df,
+  group_var = "condition",
+  contrast_var = c('WT', 'Mut'),
+  gtfPath = "../metadata/extended_annotations.gtf",
+  fastaPath = "../metadata/transcripts.fa",
+  filter_by = list(variable = "stage", value = "P3")  # keep only P1 samples
+)
+```
+
+```{r}
+saveRDS(switchList_P3, file = "../DTU/switchList_P3.rds")
+```
+

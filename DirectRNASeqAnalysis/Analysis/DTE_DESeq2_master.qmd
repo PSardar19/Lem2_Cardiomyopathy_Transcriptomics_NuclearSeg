@@ -1,0 +1,569 @@
+---
+title: "DTE_DESeq2_master"
+author: "Payel Sardar"
+format: pdf
+---
+
+## Setting the working directory
+```{r}
+setwd("D:/KCL2024/Courses/Research_Project/NanoSeq/")
+```
+
+## Installing any missing package
+```{r}
+#BiocManager::install("apeglm")
+```
+
+### Importing packages
+```{r}
+library(DESeq2)
+library(apeglm)
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(vsn)
+library(ComplexHeatmap)
+library(biomaRt)
+```
+
+## Setting the output path
+```{r}
+output_path <- '../DTE/'
+#dir.create(output_path, recursive = TRUE)
+```
+
+# Data Preprocessing
+
+Reading the counts file
+```{r}
+read_counts <- read.csv('../Counts/counts_transcript_master.txt', header = TRUE, sep = '\t')
+head(read_counts)
+```
+
+Checking the dimension of the counts data
+```{r}
+dim(read_counts)
+```
+
+Checking if all the transcript ids are unique
+```{r}
+# This returns TRUE if any duplicate rows (transcript ids) exists, FALSE otherwise
+any(duplicated(read_counts$TXNAME))
+```
+Observation: The transcript quantification data has no duplicate rows and we can proceed with the Differential transcript Expression Analysis
+
+## Extracting the first 2 columns to preserve the transcript-gene mapping
+```{r}
+tx_gene_mapping <- read_counts[,c(1,2)]
+head(tx_gene_mapping)
+
+# Dropping the gene id column from the reads data
+read_counts$GENEID <- NULL
+```
+
+
+Removing the transcript id (TXNAME) column from our dataframe as DESeq2 expects a dataframe containing only count data
+```{r}
+rownames(read_counts) <- read_counts$TXNAME
+read_counts[,1] <- NULL
+
+# Round the counts to integers
+read_counts <- round(read_counts)
+
+head(read_counts)
+```
+
+# Generating annotations
+
+```{r}
+# Creating an ensembl object
+ensembl <- useEnsembl(biomart = "genes")
+
+# For selecting the dataset
+datasets <- listDatasets(ensembl)
+head(datasets)
+```
+
+```{r}
+# Based on the version of Reference genome used for the alignment and quantification, the following dataset is selected
+ensembl_mouse <- useEnsembl(biomart = 'genes', 
+                       dataset = 'mmusculus_gene_ensembl',
+                       mirror = 'www')
+```
+
+```{r}
+tx_list <- unique(row.names(read_counts))
+```
+
+# Extracting the annotation for the specific set of genes
+```{r}
+annot_tx <- getBM(
+  attributes = c('ensembl_transcript_id', 'ensembl_gene_id',
+                 'external_gene_name', 'transcript_biotype', 
+                 'chromosome_name', 'start_position', 'end_position', 
+                 'strand','description'),
+  filters = 'ensembl_transcript_id',
+  values = tx_list,
+  mart = ensembl_mouse
+)
+head(annot_tx)
+```
+Merge transcript-level annotation with tx_gene_mapping
+```{r}
+annot_all <- merge(tx_gene_mapping, annot_tx,
+                   by.x = "TXNAME", by.y = "ensembl_transcript_id",
+                   all.x = TRUE)
+```
+
+ Identify transcripts with missing transcript-level annotations
+```{r}
+missing_tx <- annot_all[is.na(annot_all$external_gene_name), ]
+missing_gene_ids <- unique(missing_tx$GENEID)
+```
+
+Fetch gene-level annotations for fallback
+```{r}
+annot_gene <- getBM(
+  attributes = c('ensembl_gene_id', 'external_gene_name', 'description'),
+  filters = 'ensembl_gene_id',
+  values = missing_gene_ids,
+  mart = ensembl_mouse
+)
+```
+
+Merge gene-level annotations into missing entries
+```{r}
+annot_all <- merge(annot_all, annot_gene,
+                   by.x = "GENEID", by.y = "ensembl_gene_id",
+                   all.x = TRUE, suffixes = c("", "_gene"))
+```
+
+Fill in missing transcript-level fields from gene-level annotation
+```{r}
+annot_all$external_gene_name <- ifelse(is.na(annot_all$external_gene_name),
+                                       annot_all$external_gene_name_gene,
+                                       annot_all$external_gene_name)
+
+annot_all$description <- ifelse(is.na(annot_all$description),
+                                annot_all$description_gene,
+                                annot_all$description)
+
+# Clean up helper columns
+annot_all <- annot_all[, !grepl("_gene$", names(annot_all))]
+
+tail(annot_all)
+```
+
+
+```{r}
+# Saving the annotations for any downstream analysis
+write.csv(annot_all,
+          "../metadata/NanoSeq_transcript_annotations_ensembl.csv", 
+          row.names = FALSE)
+```
+
+# Creating the design matrix for DTE
+```{r}
+
+design_df <- data.frame(
+  sample_id = colnames(read_counts),
+  stage = sub("_.*", "", colnames(read_counts)),
+  condition = sub("^[^_]*_([^_]*).*", "\\1", colnames(read_counts))
+)
+
+# Fix stage name
+design_df$stage <- gsub("E18", "E18.5", design_df$stage)
+
+# Create the group column
+design_df$group <- paste(design_df$stage, design_df$condition, sep = "_")
+
+# Reorder if needed
+design_df <- design_df[, c("sample_id","stage", "condition", "group")]
+
+design_df
+```
+
+Re-ordering the columns of gene counts to match the order of sample_id in design matrix. It can be done the other way around as well
+```{r}
+read_counts <- read_counts[, match(design_df$sample_id, colnames(read_counts))]
+```
+
+```{r}
+zero_rows <- apply(read_counts, 1, \(x) all(x == 0))
+table(zero_rows)
+```
+
+```{r}
+# Removing rows (genes) where counts = 0 across all samples
+read_counts_2 <- read_counts[!zero_rows, ]
+dim(read_counts_2)
+```
+
+
+## Creating a summarized experiment object
+```{r}
+stopifnot(design_df$sample_id == colnames(read_counts_2)) # samples
+
+se <- SummarizedExperiment(
+    assays = list(counts = as.matrix(read_counts_2)),
+    colData = design_df)
+```
+
+### Access the counts
+```{r}
+head(assay(se))
+```
+
+### Access the sample annotations
+```{r}
+colData(se)
+```
+
+
+```{r}
+# Removing transcripts(rows) that do not have > 5 total counts 
+se <- se[rowSums(assay(se, "counts")) > 5, ]
+nrow(se)
+```
+
+## Visualising the distribution of Library Size across all samples
+```{r}
+# Add in the sum of all counts
+
+se$libSize <-  colSums(assay(se))
+
+colData(se) |>
+  as.data.frame() |>
+  mutate(sample_id = factor(sample_id, levels = sample_id[order(group)])) |>
+  ggplot(aes(x = sample_id, y = libSize / 1e6, fill = group)) + 
+         geom_bar(stat = "identity") + theme_bw() + 
+         labs(x = "Sample", y = "Total count in millions") + 
+         theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+```
+
+## Adjusting for differences in library size
+```{r}
+dds <- DESeq2::DESeqDataSet(se, design = ~ stage + condition)
+```
+
+```{r}
+dds <- estimateSizeFactors(dds)
+
+ggplot(data.frame(libSize = colSums(assay(dds)),
+                  sizeFactor = sizeFactors(dds),
+                  Group = dds$group),
+       aes(x = libSize, y = sizeFactor, col = Group)) + 
+    geom_point(size = 5) + theme_bw() + 
+    labs(x = "Library size", y = "Size factor")
+```
+
+## Is the variance dependent on the mean?
+```{r}
+meanSdPlot(assay(dds), ranks = FALSE)
+```
+
+It is observed that the variance increases with the average read count.
+
+### Variance stabilisation
+Transforming the data using DESeq2’s variance stabilizing transformation and then verifying if it has removed the correlation between average read count and variance.
+
+```{r}
+vsd <- DESeq2::vst(dds, blind = TRUE)
+meanSdPlot(assay(vsd), ranks = FALSE)
+```
+
+## Clustering samples based on their similarity of expression patterns (Euclidean distance)
+```{r}
+# Define colors for the heatmap
+colors <- colorRampPalette(c("blue", "white", "red"))(255)
+
+# Compute Euclidean distances between samples
+dst <- dist(t(assay(vsd)))  # transpose to get sample-wise distance
+
+# Create the heatmap with annotations and values displayed
+ComplexHeatmap::Heatmap(
+    as.matrix(dst), 
+    col = colors,
+    name = "Euclidean\ndistance",
+    cluster_rows = hclust(dst),
+    cluster_columns = hclust(dst),
+    bottom_annotation = HeatmapAnnotation(
+        condition = vsd$condition,
+        stage = vsd$stage,
+        col = list(
+            condition = c(WT = "orange", Mut = "pink"),
+            stage = c(E18.5 = "yellow", P1 = "forestgreen", P3 = "purple")
+        )
+    )
+)
+
+```
+
+## PCA Plot
+
+```{r}
+pcaData <- DESeq2::plotPCA(vsd, intgroup = c("condition", "stage"),
+                           returnData = TRUE)
+```
+
+
+```{r}
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2)) +
+    geom_point(aes(color = condition, shape = stage), size = 3) +
+    theme_minimal() +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    coord_fixed() + 
+    scale_color_manual(values = c(WT = "black", Mut = "darkmagenta"))+
+    scale_shape_manual(values = c(15,16,17))
+```
+
+# Differential Expression Analysis
+
+Normalization
+```{r}
+dds <- estimateSizeFactors(dds)
+```
+
+Statistical Modelling
+```{r}
+dds <- estimateDispersions(dds)
+```
+
+```{r}
+plotDispEsts(dds)
+```
+
+Testing
+```{r}
+dds <- nbinomWaldTest(dds)
+```
+
+```{r}
+levels(dds$stage)
+```
+
+### Function to perform DTE based on stage and condition as per requirement
+
+```{r}
+run_DTE_analysis <- function(dds, group_by = "condition", group_value, contrast_var, contrast, 
+                             annotations_tx, tx2gene,
+                             log2FC_threshold = 1.2, padj_threshold = 0.05, 
+                             output_prefix = "../DTE",
+                             file_tag = "Annotated_sig_DTE") {
+  # Subset DDS object by group
+  dds_sub <- dds[, colData(dds)[[group_by]] == group_value]
+  
+  # Drop unused factor levels in contrast variable
+  colData(dds_sub)[[contrast_var]] <- droplevels(factor(colData(dds_sub)[[contrast_var]]))
+  
+  # Set design formula
+  design(dds_sub) <- as.formula(paste("~", contrast_var))
+  
+  # Run DESeq
+  dds_sub <- DESeq2::DESeq(dds_sub)
+  
+  # Extract contrast results
+  res <- results(dds_sub, contrast = c(contrast_var, contrast[1], contrast[2]))
+  summary(res)
+  
+  # Prepare results dataframe
+  res_df <- as.data.frame(res)
+  res_df$transcript_id <- rownames(res_df)
+  res_df <- res_df[order(res_df$log2FoldChange, decreasing = TRUE), ]
+  
+  # Write raw results to file
+  raw_outfile <- file.path(output_prefix, paste0(file_tag, "_", group_by, "_", group_value, "_", contrast[1], "_vs_", contrast[2], ".csv"))
+  write.csv(res_df, raw_outfile, row.names = FALSE)
+  
+  # Filter significant transcripts
+  sig_res <- subset(res_df, padj <= padj_threshold & abs(log2FoldChange) >= log2FC_threshold)
+  
+  # Merge with transcript-level annotation
+  annotated_res <- merge(sig_res, annotations_tx, by.x = "transcript_id", by.y = "TXNAME", all.x = TRUE)
+  
+  # Handle missing gene annotations (fallback to gene-level using tx2gene)
+  missing <- is.na(annotated_res$external_gene_name)
+  
+  if (any(missing)) {
+    # Map transcript to gene ID using tx2gene
+    tx2gene_match <- tx2gene[match(annotated_res$transcript_id[missing], tx2gene$TXNAME), ]
+    annotated_res$GENEID[missing] <- tx2gene_match$GENEID
+
+    # Query missing gene annotations using biomaRt
+    missing_gene_ids <- unique(annotated_res$GENEID[missing])
+    annot_gene <- getBM(
+      attributes = c('ensembl_gene_id', 'external_gene_name', 'description'),
+      filters = 'ensembl_gene_id',
+      values = missing_gene_ids,
+      mart = useEnsembl(biomart = "genes", dataset = "mmusculus_gene_ensembl", mirror = "www")
+    )
+
+    # Merge with gene-level annotation
+    annotated_res <- merge(annotated_res, annot_gene, by.x = "GENEID", by.y = "ensembl_gene_id", all.x = TRUE, suffixes = c("", "_gene"))
+
+    # Fill in missing fields
+    annotated_res$external_gene_name <- ifelse(is.na(annotated_res$external_gene_name),
+                                               annotated_res$external_gene_name_gene,
+                                               annotated_res$external_gene_name)
+    annotated_res$description <- ifelse(is.na(annotated_res$description),
+                                        annotated_res$description_gene,
+                                        annotated_res$description)
+
+    # Remove helper columns
+    annotated_res <- annotated_res[, !grepl("_gene$", names(annotated_res))]
+  }
+  
+  # Write annotated results to file
+  annotated_outfile <- file.path(output_prefix, paste0(file_tag, "_", "Annotated_sig", "_", group_by, "_", group_value, "_", contrast[1], "_vs_", contrast[2], ".csv"))
+  write.csv(annotated_res[order(annotated_res$log2FoldChange, decreasing = TRUE), ],
+            annotated_outfile, row.names = FALSE)
+  
+  return(list(dds = dds_sub, results = res, sig_results = annotated_res))
+}
+
+```
+
+# For Stage Wise DGE
+
+## For E18.5
+
+```{r}
+res_E18.5 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "stage",
+  group_value = "E18.5",
+  contrast_var = "condition",
+  contrast = c("Mut", "WT"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "StageWiseDTE"
+)
+```
+
+## For P1
+```{r}
+res_P1 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "stage",
+  group_value = "P1",
+  contrast_var = "condition",
+  contrast = c("Mut", "WT"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "StageWiseDTE"
+)
+```
+
+## For P3
+```{r}
+res_P3 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "stage",
+  group_value = "P3",
+  contrast_var = "condition",
+  contrast = c("Mut", "WT"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "StageWiseDTE"
+)
+```
+
+# Temporal DGE Analysis
+
+## For Wild Type
+
+### For E18.5 vs P1
+```{r}
+res_WT_E18.5vsP1 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "WT",
+  contrast_var = "stage",
+  contrast = c("P1", "E18.5"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "TemporalDTE"
+)
+```
+
+### For P1 vs P3
+
+```{r}
+res_WT_P1vsP3 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "WT",
+  contrast_var = "stage",
+  contrast = c("P3", "P1"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "TemporalDTE"
+)
+```
+### For E18.5 vs P3
+```{r}
+res_WT_E18.5vsP3 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "WT",
+  contrast_var = "stage",
+  contrast = c("P3", "E18.5"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "TemporalDTE"
+)
+```
+
+## For Mutant
+
+### For E18.5 vs P1
+
+```{r}
+res_Mut_E18.5vsP1 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "Mut",
+  contrast_var = "stage",
+  contrast = c("P1", "E18.5"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "TemporalDTE"
+)
+```
+
+### For P1 vs P3
+
+```{r}
+res_Mut_P1vsP3 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "Mut",
+  contrast_var = "stage",
+  contrast = c("P3", "P1"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "TemporalDTE"
+)
+```
+
+### For E18.5 vs P3
+
+```{r}
+res_Mut_E18.5vsP3 <- run_DTE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "Mut",
+  contrast_var = "stage",
+  contrast = c("P3", "E18.5"),
+  annotations_tx = annot_all,
+  tx2gene = tx_gene_mapping,
+  file_tag = "TemporalDTE"
+)
+```
+
+
+
+

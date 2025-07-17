@@ -1,0 +1,541 @@
+---
+title: "DGE_DESeq2_master"
+author: "Payel Sardar"
+format: pdf
+---
+
+## Setting the working directory
+```{r}
+# Change the path to the home directory of the project
+setwd("D:/KCL2024/Courses/Research_Project/NanoSeq/")
+```
+
+## Installing any missing package
+```{r}
+#BiocManager::install("apeglm")
+```
+
+### Importing packages
+```{r}
+library(DESeq2)
+library(apeglm)
+library(tidyverse)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(vsn)
+library(ComplexHeatmap)
+library(biomaRt)
+```
+
+## Setting the output path
+```{r}
+# This creates an output directory to store the results from the analysis
+output_path <- '../DGE_lf/'  # Alter as needed
+dir.create(output_path, recursive = TRUE)
+```
+
+# Data Preprocessing
+
+Reading the counts file
+```{r}
+# Change the path to the counts data as required
+read_counts <- read.csv('../Counts/counts_gene_master.txt', header = TRUE, sep = '\t')
+head(read_counts)
+```
+
+Checking the dimension of the counts data
+```{r}
+dim(read_counts)
+```
+
+Checking if all the gene ids are unique
+```{r}
+# This returns TRUE if any duplicate rows (gene ids) exists, FALSE otherwise
+any(duplicated(read_counts$GENEID))
+```
+Observation: The gene expression data has no duplicate rows and we can proceed with the Differential Gene Expression Analysis
+
+Removing the gene_id column from our dataframe as DESeq2 expects a dataframe containing only count data
+```{r}
+rownames(read_counts) <- read_counts$GENEID
+read_counts[,1] <- NULL
+head(read_counts)
+
+# Round the counts to integers
+read_counts <- round(read_counts)
+```
+
+# Generating annotations
+
+```{r}
+# Creating an ensembl object
+ensembl <- useEnsembl(biomart = "genes")
+
+# For selecting the dataset
+datasets <- listDatasets(ensembl)
+head(datasets)
+```
+
+```{r}
+# Based on the version of Reference genome used for the alignment and quantification, the following dataset is selected
+ensembl_mouse <- useEnsembl(biomart = 'genes', 
+                       dataset = 'mmusculus_gene_ensembl',
+                       mirror = 'www')
+```
+
+```{r}
+gene_list <- unique(row.names(read_counts))
+```
+
+# Extracting the annotation for the specific set of genes
+```{r}
+annotations <- getBM(
+  attributes = c('ensembl_gene_id', 'external_gene_name', 'description'),
+  filters = 'ensembl_gene_id',
+  values = gene_list,
+  mart = ensembl_mouse
+)
+```
+
+Viewing the first few rows of the annotations dataframe
+```{r}
+head(annotations)
+```
+
+```{r}
+# Saving the annotations for any downstream analysis
+write.csv(annotations,
+          "../metadata/NanoSeq_gene_annotations_ensembl.csv", 
+          row.names = FALSE)
+```
+
+# Creating the design matrix for DGE
+```{r}
+
+design_df <- data.frame(
+  sample_id = colnames(read_counts),
+  stage = sub("_.*", "", colnames(read_counts)),
+  condition = sub("^[^_]*_([^_]*).*", "\\1", colnames(read_counts))
+)
+
+# Fix stage name
+design_df$stage <- gsub("E18", "E18.5", design_df$stage)
+
+# Create the group column
+design_df$group <- paste(design_df$stage, design_df$condition, sep = "_")
+
+# Reorder if needed
+design_df <- design_df[, c("sample_id","stage", "condition", "group")]
+
+design_df
+```
+
+Re-ordering the columns of gene counts to match the order of sample_id in design matrix. It can be done the other way around as well
+```{r}
+read_counts <- read_counts[, match(design_df$sample_id, colnames(read_counts))]
+```
+
+```{r}
+zero_rows <- apply(read_counts, 1, \(x) all(x == 0))
+```
+
+```{r}
+# Removing rows (genes) where counts = 0 across all samples
+read_counts_2 <- read_counts[!zero_rows, ]
+```
+
+
+## Creating a summarized experiment object
+```{r}
+stopifnot(design_df$sample_id == colnames(read_counts_2)) # samples
+
+se <- SummarizedExperiment(
+    assays = list(counts = as.matrix(read_counts_2)),
+    colData = design_df)
+```
+
+### Access the counts
+```{r}
+head(assay(se),3)
+```
+
+### Access the sample annotations
+```{r}
+colData(se)
+```
+
+
+```{r}
+# Removing genes/rows that do not have > 5 total counts (Removing Noise)
+se <- se[rowSums(assay(se, "counts")) > 5, ]
+```
+
+## Visualising the distribution of Library Size across all samples
+```{r}
+# Add in the sum of all counts
+
+se$libSize <-  colSums(assay(se))
+
+colData(se) |>
+  as.data.frame() |>
+  mutate(sample_id = factor(sample_id, levels = sample_id[order(group)])) |>
+  ggplot(aes(x = sample_id, y = libSize / 1e6, fill = group)) + 
+    geom_bar(stat = "identity") + 
+    theme_bw() + 
+    labs(x = "Sample", y = "Total count in millions") + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+    scale_x_discrete(labels = function(x) sub("\\.sorted$", "", x))
+
+```
+
+```{r}
+# Saving the plot
+ggsave("../Plots/NanoSeq_libSize.png", width = 8, height = 6, dpi = 300)
+```
+
+## Adjusting for differences in library size
+```{r}
+dds <- DESeq2::DESeqDataSet(se, design = ~ stage + condition)
+```
+
+```{r}
+dds <- estimateSizeFactors(dds)
+
+ggplot(data.frame(libSize = colSums(assay(dds)),
+                  sizeFactor = sizeFactors(dds),
+                  Group = dds$group),
+       aes(x = libSize, y = sizeFactor, col = Group)) + 
+    geom_point(size = 5) + theme_bw() + 
+    labs(x = "Library size", y = "Size factor")
+```
+
+```{r}
+# Saving the plot
+ggsave("../Plots/NanoSeq_SizeFactor.png", width = 8, height = 6, dpi = 300)
+```
+
+## Is the variance dependent on the mean?
+```{r}
+p <- meanSdPlot(assay(dds), ranks = FALSE, plot = FALSE)
+p$gg + 
+  ggtitle("Before Variance Stabilisation") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+It is observed that the variance increases with the average read count.
+
+### Variance stabilisation
+Transforming the data using DESeq2’s variance stabilizing transformation and then verifying if it has removed the correlation between average read count and variance.
+
+```{r}
+vsd <- DESeq2::vst(dds, blind = FALSE)
+p <- meanSdPlot(assay(vsd), ranks = FALSE)
+p$gg + 
+  ggtitle("After Variance Stabilisation") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Saving the variance stabilised normalised expression values
+```{r}
+normalized_counts <- assay(vsd)
+head(normalized_counts)
+write.csv(normalized_counts, '../DGE/vsd_norm_gene_counts_NanoSeq.csv', row.names = TRUE)
+```
+
+```{r}
+long_df <- normalized_counts %>%
+     as.data.frame() %>%
+     rownames_to_column("gene_id") %>%
+     pivot_longer(
+         cols = -gene_id,
+         names_to = "sample_id",
+         values_to = "expression" 
+         )
+merged_df <- long_df %>%
+    inner_join(design_df, by = "sample_id")
+
+agg_df <- merged_df %>%
+     group_by(gene_id, stage, condition) %>%
+     summarise(
+         mean_expr = mean(expression),
+         sd_expr = sd(expression),
+         .groups = "drop"
+     ) %>%
+     mutate(stage = factor(stage, levels = c("E18.5", "P1", "P3")))
+
+agg_df <- agg_df %>%
+     left_join(annotations %>% dplyr::select(ensembl_gene_id, external_gene_name), 
+               by = c("gene_id" = "ensembl_gene_id"))
+
+write.csv(agg_df, '../DGE/Grouped_norm_gene_counts_NanoSeq.csv',row.names = FALSE)
+```
+
+
+## Clustering samples based on their similarity of expression patterns (Euclidean distance)
+```{r}
+# Define colors for the heatmap
+colors <- colorRampPalette(c("blue", "white", "red"))(255)
+
+# Compute Euclidean distances between samples
+dst <- dist(t(assay(vsd)))  # transpose to get sample-wise distance
+
+# Create the heatmap with annotations and values displayed
+ComplexHeatmap::Heatmap(
+    as.matrix(dst), 
+    col = colors,
+    name = "Euclidean\ndistance",
+    cluster_rows = hclust(dst),
+    cluster_columns = hclust(dst),
+    bottom_annotation = HeatmapAnnotation(
+        condition = vsd$condition,
+        stage = vsd$stage,
+        col = list(
+            condition = c(WT = "orange", Mut = "pink"),
+            stage = c(E18.5 = "yellow", P1 = "forestgreen", P3 = "purple")
+        )
+    )
+)
+
+```
+
+## PCA Plot
+
+```{r}
+pcaData <- DESeq2::plotPCA(vsd, intgroup = c("condition", "stage"),
+                           returnData = TRUE)
+```
+
+Making the PCA plot
+```{r}
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(x = PC1, y = PC2)) +
+    geom_point(aes(color = condition, shape = stage), size = 3) +
+    theme_minimal() +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    coord_fixed() + 
+    scale_color_manual(values = c(WT = "black", Mut = "darkmagenta"))+
+    scale_shape_manual(values = c(15,16,17)) +
+  ggtitle("Principal Component Analysis (PCA)")
+```
+
+# Differential Expression Analysis
+
+Normalization
+```{r}
+dds <- estimateSizeFactors(dds)
+```
+
+Statistical Modelling
+```{r}
+dds <- estimateDispersions(dds)
+```
+
+```{r}
+plotDispEsts(dds)
+title("Dispersion Estimates Across Mean Expression")
+```
+
+Testing
+```{r}
+dds <- nbinomWaldTest(dds)
+```
+
+```{r}
+levels(dds$stage)
+```
+```{r}
+# Relevel condition factor to set WT as reference
+colData(dds)$condition <- relevel(colData(dds)$condition, ref = "WT")
+
+# Verify new level order
+levels(colData(dds)$condition)
+```
+
+
+### Function to perform DGE based on stage and condition as per requirement
+
+```{r}
+run_DGE_analysis <- function(dds, group_by = "condition", group_value, contrast_var, contrast, annotations, 
+                             log2FC_threshold = 1.2, padj_threshold = 0.05, 
+                             output_prefix = "../DGE_lf",
+                             file_tag = "Annotated_sig_DGE") {
+  # Subset DDS object
+  dds_sub <- dds[, colData(dds)[[group_by]] == group_value]
+  
+  # Drop unused factor levels in the contrast variable
+  colData(dds_sub)[[contrast_var]] <- droplevels(factor(colData(dds_sub)[[contrast_var]]))
+  
+  # Set reference level for contrast variable to the SECOND element of contrast
+  colData(dds_sub)[[contrast_var]] <- relevel(
+    colData(dds_sub)[[contrast_var]], 
+    ref = contrast[2]
+  )
+  
+  # Set design
+  design(dds_sub) <- as.formula(paste("~", contrast_var))
+  
+  # Run DESeq
+  dds_sub <- DESeq2::DESeq(dds_sub)
+  
+  # Perform contrast with log2FC shrinkage
+  coef_name <- resultsNames(dds_sub)[grep(paste0(contrast_var, "_", contrast[1], "_vs_", contrast[2]), resultsNames(dds_sub))]
+  if (length(coef_name) != 1) stop("Contrast coefficient not found or ambiguous.")
+  
+  res <- lfcShrink(dds_sub, coef = coef_name, type = "apeglm")
+  summary(res)
+  
+  # Convert to data frame
+  res_df <- as.data.frame(res)
+  res_df <- res_df[order(res_df$log2FoldChange, decreasing = TRUE), ]
+  
+  # Write raw results
+  raw_outfile <- file.path(output_prefix, paste0(file_tag, "_", group_by, "_", group_value, "_", contrast[1], "_vs_", contrast[2], ".csv"))
+  write.csv(res_df, raw_outfile, row.names = TRUE)
+  
+  # Filter significant genes
+  sig_res <- subset(res_df, padj <= padj_threshold & abs(log2FoldChange) >= log2FC_threshold)
+  sig_res$gene_id <- rownames(sig_res)
+  
+  # Annotate
+  annotated_res <- merge(sig_res, annotations, by.x = "gene_id", by.y = "ensembl_gene_id", all.x = TRUE)
+  
+  # Write annotated significant DEGs with customizable tag
+  annotated_outfile <- file.path(output_prefix, paste0(file_tag, "_", "Annotated_sig" , "_", group_by, "_", group_value, "_", contrast[1], "_vs_", contrast[2], ".csv"))
+  write.csv(annotated_res[order(annotated_res$log2FoldChange, decreasing = TRUE), ],
+            annotated_outfile, row.names = FALSE)
+  
+  return(list(dds = dds_sub, results = res, sig_results = annotated_res))
+}
+```
+
+# For Stage Wise DGE
+
+## For E18.5
+
+```{r}
+res_E18.5 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "stage",
+  group_value = "E18.5",
+  contrast_var = "condition",
+  contrast = c("Mut", "WT"),
+  annotations = annotations,
+  file_tag = "StageWiseDGE"
+)
+```
+## For P1
+```{r}
+res_P1 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "stage",
+  group_value = "P1",
+  contrast_var = "condition",
+  contrast = c("Mut", "WT"),
+  annotations = annotations,
+  file_tag = "StageWiseDGE"
+)
+```
+
+## For P3
+```{r}
+res_P3 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "stage",
+  group_value = "P3",
+  contrast_var = "condition",
+  contrast = c("Mut", "WT"),
+  annotations = annotations,
+  file_tag = "StageWiseDGE"
+)
+```
+# Temporal DGE Analysis
+
+## For Wild Type
+
+### For E18.5 vs P1
+```{r}
+res_WT_E18.5vsP1 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "WT",
+  contrast_var = "stage",
+  contrast = c("P1", "E18.5"),
+  annotations = annotations,
+  file_tag = "TemporalDGE"
+)
+```
+### For P1 vs P3
+
+```{r}
+res_WT_P1vsP3 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "WT",
+  contrast_var = "stage",
+  contrast = c("P3", "P1"),
+  annotations = annotations,
+  file_tag = "TemporalDGE"
+)
+```
+
+### For E18.5 vs P3
+```{r}
+res_WT_E18.5vsP3 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "WT",
+  contrast_var = "stage",
+  contrast = c("P3", "E18.5"),
+  annotations = annotations,
+  file_tag = "TemporalDGE"
+)
+```
+## For Mutant
+
+### For E18.5 vs P1
+
+```{r}
+res_Mut_E18.5vsP1 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "Mut",
+  contrast_var = "stage",
+  contrast = c("P1", "E18.5"),
+  annotations = annotations,
+  file_tag = "TemporalDGE"
+)
+```
+
+### For P1 vs P3
+
+```{r}
+res_Mut_P1vsP3 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "Mut",
+  contrast_var = "stage",
+  contrast = c("P3", "P1"),
+  annotations = annotations,
+  file_tag = "TemporalDGE"
+)
+```
+
+### For E18.5 vs P3
+
+```{r}
+res_Mut_E18.5vsP3 <- run_DGE_analysis(
+  dds = dds,
+  group_by = "condition",
+  group_value = "Mut",
+  contrast_var = "stage",
+  contrast = c("P3", "E18.5"),
+  annotations = annotations,
+  file_tag = "TemporalDGE"
+)
+```
+
+
+
+
